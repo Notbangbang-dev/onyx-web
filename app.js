@@ -103,10 +103,20 @@
   }
   function base() { return (settings.endpoint || '').trim().replace(/\/+$/, ''); }
 
-  function buildBody(msgs, sys, includeTemp) {
+  // Newer OpenAI reasoning models reject `max_tokens`/`temperature`.
+  function isReasoning(model) { return /^(o\d|gpt-5)/i.test(model || ''); }
+  function buildBody(msgs, sys, opts) {
+    opts = opts || {};
     const isA = settings.provider === 'ANTHROPIC';
-    const body = { model: settings.model, max_tokens: settings.maxTokens, stream: settings.streamResponses };
-    if (includeTemp) body.temperature = settings.temperature;
+    const body = { model: settings.model, stream: settings.streamResponses };
+    // token limit param: some models want max_completion_tokens instead of max_tokens
+    const useCompletion = opts.maxCompletion || (!isA && isReasoning(settings.model));
+    if (isA) body.max_tokens = settings.maxTokens;
+    else if (useCompletion) body.max_completion_tokens = settings.maxTokens;
+    else body.max_tokens = settings.maxTokens;
+    // temperature: omit if the model rejected it, or for reasoning models
+    const wantTemp = opts.temp !== false && !(!isA && isReasoning(settings.model));
+    if (wantTemp) body.temperature = settings.temperature;
     if (isA) {
       if (sys) body.system = sys;
       body.messages = msgs.map(m => {
@@ -141,17 +151,27 @@
     const path = settings.provider === 'ANTHROPIC' ? '/messages' : '/chat/completions';
     const sys = resolvedSystemPrompt(chat);
     const msgs = outMessages(chat);
-    async function attempt(includeTemp) {
+    const opts = {};
+    async function attempt() {
       abortCtrl = new AbortController();
-      return fetch(base() + path, { method: 'POST', headers: headers(key), body: JSON.stringify(buildBody(msgs, sys, includeTemp)), signal: abortCtrl.signal });
+      try {
+        return await fetch(base() + path, { method: 'POST', headers: headers(key), body: JSON.stringify(buildBody(msgs, sys, opts)), signal: abortCtrl.signal });
+      } catch (e) {
+        if (e.name === 'AbortError') throw e;
+        throw new Error("Couldn't reach the endpoint. This is usually CORS or a bad URL — the provider must allow browser requests (OpenAI & Anthropic do; a custom/local server may need CORS enabled or a proxy).");
+      }
     }
-    let resp = await attempt(true);
-    if (!resp.ok) {
+    let resp = await attempt();
+    // Adaptively retry when a model rejects specific params.
+    for (let tries = 0; tries < 2 && !resp.ok && resp.status === 400; tries++) {
       const errTxt = await resp.text();
-      if (resp.status === 400 && /temperature/i.test(errTxt)) { resp = await attempt(false); }
-      else throw new Error(errorMsg(resp.status, errTxt));
-      if (!resp.ok) throw new Error(errorMsg(resp.status, await resp.text()));
+      let changed = false;
+      if (/temperature/i.test(errTxt) && opts.temp !== false) { opts.temp = false; changed = true; }
+      if (/max_tokens/i.test(errTxt) && !opts.maxCompletion) { opts.maxCompletion = true; changed = true; }
+      if (!changed) throw new Error(errorMsg(resp.status, errTxt));
+      resp = await attempt();
     }
+    if (!resp.ok) throw new Error(errorMsg(resp.status, await resp.text()));
     if (!settings.streamResponses) { const t = await resp.text(); parseFull(t, onDelta, onUsage); return; }
     const reader = resp.body.getReader(); const dec = new TextDecoder(); let buf = '';
     while (true) {
